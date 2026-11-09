@@ -13,7 +13,19 @@ type OwnerMessage = {
   created_at: string;
 };
 
+type Appointment = {
+  customer_name: string;
+  service: string;
+  start_time: string;
+  end_time: string;
+  duration_minutes: number;
+};
+
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL!;
+
+function formatTime(iso: string) {
+  return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
 
 export default function OwnerDashboard() {
   const router = useRouter();
@@ -22,6 +34,11 @@ export default function OwnerDashboard() {
   const [customerName, setCustomerName] = useState("");
   const [purpose, setPurpose] = useState("");
   const [loading, setLoading] = useState(false);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [scheduleError, setScheduleError] = useState("");
+  const [summary, setSummary] = useState("");
+  const [summaryError, setSummaryError] = useState("");
+  const [summaryLoading, setSummaryLoading] = useState(false);
 
   useEffect(() => {
     checkAuth();
@@ -34,6 +51,7 @@ export default function OwnerDashboard() {
     } else {
       setCheckingAuth(false);
       loadMessages();
+      loadSchedule();
     }
   }
 
@@ -57,6 +75,51 @@ export default function OwnerDashboard() {
     }
     if (!res.ok) return;
     setMessages(await res.json());
+  }
+
+  async function loadSchedule() {
+    setScheduleError("");
+    try {
+      const headers = await getAuthHeader();
+      const res = await fetch(`${BACKEND_URL}/schedule`, { headers });
+      if (res.status === 401 || res.status === 403) {
+        await supabase.auth.signOut();
+        router.push("/login");
+        return;
+      }
+      const data = await res.json();
+      if (!res.ok) {
+        setScheduleError(data.detail || "Could not load today's schedule.");
+        return;
+      }
+      setAppointments(data.appointments);
+    } catch {
+      setScheduleError("Could not load today's schedule.");
+    }
+  }
+
+  async function generateSummary() {
+    setSummaryLoading(true);
+    setSummaryError("");
+    try {
+      const headers = await getAuthHeader();
+      const res = await fetch(`${BACKEND_URL}/day-summary`, { headers });
+      if (res.status === 401 || res.status === 403) {
+        await supabase.auth.signOut();
+        router.push("/login");
+        return;
+      }
+      const data = await res.json();
+      if (!res.ok) {
+        setSummaryError(data.detail || "Could not generate the summary.");
+      } else {
+        setSummary(data.summary);
+      }
+    } catch {
+      setSummaryError("Could not generate the summary.");
+    } finally {
+      setSummaryLoading(false);
+    }
   }
 
   async function draftNewText() {
@@ -90,6 +153,29 @@ export default function OwnerDashboard() {
         <button onClick={handleLogout} style={{ padding: "6px 12px", background: "#eee", border: "1px solid #ccc", borderRadius: 4 }}>
           Log Out
         </button>
+      </div>
+
+      <div style={{ border: "1px solid #ccc", borderRadius: 8, padding: 16, marginBottom: 24 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ margin: 0 }}>Today&apos;s schedule</h3>
+          <button
+            onClick={generateSummary}
+            disabled={summaryLoading}
+            style={{ padding: "6px 12px", background: "#0070f3", color: "white", border: "none", borderRadius: 4 }}
+          >
+            {summaryLoading ? "Summarizing..." : "Summarize my day"}
+          </button>
+        </div>
+        {summary && <p style={{ background: "#f5f5f5", borderRadius: 4, padding: 12 }}>{summary}</p>}
+        {summaryError && <p style={{ color: "red" }}>{summaryError}</p>}
+        {scheduleError && <p style={{ color: "red" }}>{scheduleError}</p>}
+        {!scheduleError && appointments.length === 0 && <p>No appointments today.</p>}
+        {appointments.map((appt, i) => (
+          <div key={i} style={{ padding: "8px 0", borderTop: i === 0 ? "none" : "1px solid #eee" }}>
+            <strong>{formatTime(appt.start_time)} – {formatTime(appt.end_time)}</strong>{" "}
+            {appt.customer_name} · {appt.service}
+          </div>
+        ))}
       </div>
 
       <div style={{ border: "1px solid #ccc", borderRadius: 8, padding: 16, marginBottom: 24 }}>
