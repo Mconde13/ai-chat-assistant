@@ -1,3 +1,14 @@
 venv/
 .env
 __pycache__/
+
+# Real business data: keep the real knowledge base and test set out of git (see data/kb_testset.example.json)
+data/kb_testset.json
+
+# Eval run output, calibration reports and local server logs
+eval_results*.csv
+eval_*.log
+eval_*summary.txt
+calibration*.csv
+calibration*.md
+server*.log
