@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import csv
 import json
@@ -21,9 +22,26 @@ logger = logging.getLogger(__name__)
 TESTSET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "kb_testset.json")
 RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_results.csv")
 
-JUDGE_MODEL = "claude-sonnet-4-5"
-# USD per million tokens (input, output) for the model above
-PRICE_PER_MTOK = (3.0, 15.0)
+# The judge stays on claude-sonnet-4-5 until its scores have been calibrated against the newer model
+# (see the migration notes); set EVAL_JUDGE_MODEL to try another one.
+JUDGE_MODEL = os.getenv("EVAL_JUDGE_MODEL", "claude-sonnet-4-5")
+# USD per million tokens (input, output), by judge model
+PRICES_PER_MTOK = {
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+}
+PRICE_PER_MTOK = PRICES_PER_MTOK.get(JUDGE_MODEL, (3.0, 15.0))
+# Models in the 5.x family reject a forced tool_choice and think before answering, so they are called differently
+# (same pattern as the backend's NEWER_MODEL in main.py).
+NEWER_MODEL = re.compile(r"^claude-(sonnet|opus|haiku|fable|mythos)-5")
+JUDGE_EFFORT = os.getenv("EVAL_JUDGE_EFFORT", "low")
+THINKING_HEADROOM_TOKENS = 1024
+JUDGE_ATTEMPTS = 3
+VERDICTS = ("pass", "fail", "partial")
+
+
+class NoVerdict(Exception):
+    """The judge replied without a usable record_verdict call."""
 
 # /ask is rate limited to 10/minute per IP, so space the calls out
 SECONDS_BETWEEN_CALLS = 6.5
@@ -66,8 +84,46 @@ JUDGE_TOOL = {
 }
 
 
-def cost_estimate(input_tokens, output_tokens):
-    return (input_tokens * PRICE_PER_MTOK[0] + output_tokens * PRICE_PER_MTOK[1]) / 1_000_000
+def make_eval_client():
+    """Anthropic client for judging, on the eval-only key.
+
+    Evals must never spend the production key's balance (an eval run once used up the credit the live site
+    depends on), so this reads EVAL_ANTHROPIC_API_KEY and refuses to fall back to ANTHROPIC_API_KEY."""
+    key = os.getenv("EVAL_ANTHROPIC_API_KEY")
+    if not key:
+        logger.error("EVAL_ANTHROPIC_API_KEY is missing. Create a separate API key (ideally in its own Console "
+                     "workspace with a spend limit) and put it in backend/.env; see .env.example.")
+        sys.exit(1)
+    if key == os.getenv("ANTHROPIC_API_KEY"):
+        logger.error("EVAL_ANTHROPIC_API_KEY is the same key as ANTHROPIC_API_KEY (production). Use a separate key.")
+        sys.exit(1)
+    return Anthropic(api_key=key)
+
+
+def cost_estimate(input_tokens, output_tokens, model=None):
+    price_in, price_out = PRICES_PER_MTOK.get(model, PRICE_PER_MTOK) if model else PRICE_PER_MTOK
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+
+def judge_request_kwargs(model):
+    """Model-specific parts of the judge request."""
+    if NEWER_MODEL.match(model):
+        # No forced tool_choice (400 on these models): the prompt tells it to call the tool instead.
+        return {"model": model, "max_tokens": 300 + THINKING_HEADROOM_TOKENS,
+                "output_config": {"effort": JUDGE_EFFORT}, "tools": [JUDGE_TOOL]}
+    return {"model": model, "max_tokens": 300, "tools": [JUDGE_TOOL],
+            "tool_choice": {"type": "tool", "name": "record_verdict"}}
+
+
+def read_verdict(message):
+    """(verdict, reasoning) from the first record_verdict call; NoVerdict if there is none or it is unusable."""
+    for block in message.content:
+        if getattr(block, "type", None) == "tool_use" and block.name == "record_verdict":
+            verdict = str((block.input or {}).get("verdict", "")).strip().lower()
+            if verdict not in VERDICTS:
+                raise NoVerdict(f"verdict {verdict!r} is not one of {VERDICTS}")
+            return verdict, str((block.input or {}).get("reasoning", ""))
+    raise NoVerdict(f"no record_verdict call in the reply (stop_reason={message.stop_reason})")
 
 
 def ask_backend(http, base_url, question):
@@ -86,27 +142,55 @@ def ask_backend(http, base_url, question):
         return response.json(), elapsed
 
 
-def judge(claude, item, answer):
+def load_knowledge(path=TESTSET_PATH):
+    """The business information the chatbot answers from (the same entries that are embedded for retrieval)."""
+    with open(path, encoding="utf-8") as f:
+        entries = json.load(f)["knowledge_base"]
+    return "\n\n".join(f"[{e['id']}] {e['text']}" for e in entries)
+
+
+KNOWLEDGE_GUIDE = (
+    "The knowledge base above is all the information the chatbot is allowed to use. Use it to check the answer's "
+    "claims: a claim that the knowledge base supports is not an invention and does not contradict EXPECTED, even "
+    "when EXPECTED does not mention it; a claim that is missing from the knowledge base or goes against it is an "
+    "error. The facts an answer must contain still come from EXPECTED, and the grading rule decides the verdict: "
+    "do not mark an answer down for leaving out knowledge-base facts that EXPECTED does not require."
+)
+
+
+def judge(claude, item, answer, model=None, knowledge=None):
+    knowledge_block = f"\n<knowledge_base>\n{knowledge}\n</knowledge_base>\n" if knowledge else ""
     prompt = f"""You are grading a customer-service chatbot for a lash extension business. The owner is Jane.
 
 Question type: {item['type']}
 Grading rule: {RULES[item['type']]}
-
+{knowledge_block}
 <question>{item['q']}</question>
 <expected>{item.get('expected', '')}</expected>
 <actual_answer>{answer}</actual_answer>
 
 Judge the actual answer against the expected behaviour using the grading rule. Wording may differ; judge facts and behaviour, not phrasing."""
-    message = claude.messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=300,
-        tools=[JUDGE_TOOL],
-        tool_choice={"type": "tool", "name": "record_verdict"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-    result = next(block.input for block in message.content if block.type == "tool_use")
-    verdict = str(result["verdict"]).lower()
-    return verdict, result["reasoning"], message.usage.input_tokens, message.usage.output_tokens
+    if knowledge:
+        prompt += "\n\n" + KNOWLEDGE_GUIDE
+    if NEWER_MODEL.match(model or JUDGE_MODEL):
+        prompt += "\n\nGive your verdict by calling the record_verdict tool."
+    tokens_in = tokens_out = 0
+    for attempt in range(1, JUDGE_ATTEMPTS + 1):
+        message = claude.messages.create(
+            **judge_request_kwargs(model or JUDGE_MODEL),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        tokens_in += message.usage.input_tokens
+        tokens_out += message.usage.output_tokens
+        try:
+            verdict, reasoning = read_verdict(message)
+            return verdict, reasoning, tokens_in, tokens_out
+        except NoVerdict as e:
+            # Never turn a missing verdict into a pass or a fail: try again, and if it keeps happening the
+            # caller records the question as an error.
+            logger.warning(f"{item['id']}: judge attempt {attempt}/{JUDGE_ATTEMPTS}: {e}")
+            if attempt == JUDGE_ATTEMPTS:
+                raise
 
 
 def print_breakdown(title, rows, key):
@@ -129,13 +213,17 @@ def main():
                         help="Seconds between /ask calls (use 21+ on Voyage's free tier, which allows 3 requests/minute)")
     parser.add_argument("--ids", help="Only run these question ids, comma separated (for example q90,q91)")
     parser.add_argument("--out", default=RESULTS_PATH, help="Where to write the results (.csv or .json)")
+    parser.add_argument("--no-kb", action="store_true",
+                        help="Do not show the judge the knowledge base (the old judging, for comparing with earlier scores)")
     args = parser.parse_args()
     base_url = args.url.rstrip("/")
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        logger.error("ANTHROPIC_API_KEY is missing from the environment")
+    claude = make_eval_client()
+    try:
+        knowledge = None if args.no_kb else load_knowledge()
+    except (OSError, KeyError, json.JSONDecodeError) as e:
+        logger.error(f"Could not read knowledge_base from {TESTSET_PATH}: {e}")
         sys.exit(1)
-    claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     try:
         with open(TESTSET_PATH, "r", encoding="utf-8") as f:
@@ -169,6 +257,8 @@ def main():
                 "id": item["id"], "type": item["type"], "audience": item.get("audience", ""),
                 "question": item["q"], "answer": "", "sources": "", "response_time_s": "",
                 "verdict": "error", "reasoning": "", "tokens": 0, "cost_estimate_usd": 0.0,
+                # Scores from different judges (or with and without the knowledge base) are not comparable
+                "judge_model": JUDGE_MODEL, "judge_sees_kb": knowledge is not None,
             }
             tokens_in = tokens_out = 0
             try:
@@ -180,7 +270,7 @@ def main():
                 tokens_in += usage.get("input_tokens", 0)
                 tokens_out += usage.get("output_tokens", 0)
 
-                verdict, reasoning, j_in, j_out = judge(claude, item, row["answer"])
+                verdict, reasoning, j_in, j_out = judge(claude, item, row["answer"], knowledge=knowledge)
                 row["verdict"], row["reasoning"] = verdict, reasoning
                 tokens_in += j_in
                 tokens_out += j_out
