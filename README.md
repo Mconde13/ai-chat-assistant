@@ -139,11 +139,12 @@ then `npm run dev` and open http://localhost:3000. The owner dashboard is at `/o
 
 ### Models
 
-The code defaults to `claude-sonnet-4-5`, **which Anthropic retires on 2026-11-30**. Set
-`BOT_MODEL=claude-sonnet-5-5` (and optionally `BOT_EFFORT`, default `low`) to move `/ask`, the query
-rewriter and the owner routes together; `REWRITE_MODEL` and `OWNER_MODEL` override the rewriter and the
-owner routes individually. Switching or rolling back is an environment change, not a deploy. Details and
-the evaluation results are in [docs/model-migration.md](docs/model-migration.md).
+The code defaults to `claude-sonnet-5-5` with effort `low` (`BOT_EFFORT`, only sent to `claude-*-5`
+models), so a fresh deployment needs no model settings. `BOT_MODEL` moves `/ask`, the query rewriter and
+the owner routes together; `REWRITE_MODEL` and `OWNER_MODEL` override the rewriter and the owner routes
+individually. `claude-sonnet-4-5` can still be selected with `BOT_MODEL`, but **Anthropic retires it on
+2026-11-30**. Switching is an environment change, not a deploy. Details and the evaluation results are in
+[docs/model-migration.md](docs/model-migration.md).
 
 ## Evaluation
 

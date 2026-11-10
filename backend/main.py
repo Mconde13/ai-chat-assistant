@@ -27,8 +27,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Models come from the environment, so switching models (and rolling back) is a Railway
-# variable change, not a deploy. The defaults are the current production model.
-CLAUDE_MODEL = os.getenv("BOT_MODEL", "claude-sonnet-4-5")  # /ask answers
+# variable change, not a deploy. The default is claude-sonnet-5-5; claude-sonnet-4-5 can still be
+# selected with BOT_MODEL until Anthropic retires it on 2026-11-30.
+CLAUDE_MODEL = os.getenv("BOT_MODEL", "claude-sonnet-5-5")  # /ask answers
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", CLAUDE_MODEL)       # query rewriter
 OWNER_MODEL = os.getenv("OWNER_MODEL", CLAUDE_MODEL)           # /draft-text and /day-summary
 CLAUDE_EFFORT = os.getenv("BOT_EFFORT", "low")              # only sent to claude-*-5 models

@@ -43,6 +43,9 @@ Production was switched by setting `BOT_MODEL=claude-sonnet-5-5` in the host's e
 deleting that variable, which works until the old model is retired. The first live checks after the switch
 returned 13 of 13 requests successfully with a median of 3.8 s.
 
+This repository's code now defaults to `claude-sonnet-5-5`, so a fresh deployment needs no `BOT_MODEL`
+setting. Set `BOT_MODEL=claude-sonnet-4-5` to go back until that model is retired.
+
 ## Moving the eval judge
 
 The judge had to move too, and a different judge changes the scores. Calibration over 534 saved answers found
